@@ -3,3 +3,4 @@ pymongo
 fastapi
 uvicorn
 python-multipart
+orjson

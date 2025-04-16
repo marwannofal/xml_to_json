@@ -20,8 +20,8 @@ app = FastAPI()
 
 # Connect to MongoDB
 client = DB("mongodb://localhost:27017/")
-db = client["mydatabase"]
-collection = db["employees"]
+db = client["xml_to_json"]
+collection = db["xml_to_json"]
 
 @app.post("/convert/")
 async def convert_xml_to_json(file: UploadFile = File(...)):
