@@ -2,9 +2,8 @@ import requests
 
 # Define multiple XML payloads
 xml_list = [
-    "<xml><item>Item 1</item></xml>",
-    "<xml><item>Item 2</item></xml>",
-    "<xml><item>Item 3</item></xml>"
+    "<xml><item>Item 1</item><item>Item 2</item><item>Item 3</item></xml>",
+
 ]
 
 # Combine XMLs into one payload (e.g., wrap them in a root tag if required)
@@ -33,7 +32,7 @@ headers = {
 }
 
 # URL
-url = 'http://localhost:8000/api/xml_secondary/'
+url = 'http://localhost:8000/api/xml/'
 
 # Send request
 try:

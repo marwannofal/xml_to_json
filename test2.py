@@ -2,14 +2,15 @@ from fastapi import FastAPI, Request, HTTPException, Header, File, UploadFile, A
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 import os, json, time, uuid, traceback, xml.etree.ElementTree as ET
 import xmltodict
-from pymongo import MongoClient
+from pymongo import MongoClient, errors as mongo_errors
 from bson import ObjectId
 import logging, logging.handlers
 from datetime import datetime
 import uvicorn
+
 
 """Configuration / Utilities"""
 
@@ -48,71 +49,95 @@ class LoggerConfig:
 class MongoManager:
     def __init__(self, uri: str, db_name: str, logger: logging.Logger):
         self.logger = logger
+        self.uri = uri
+        self.db_name = db_name
+        self.client = None
+        self.db = None
+        self.collection = None
+        self.connect()
+        
+    def connect(self) -> bool:
+        """Establish connection to MongoDB with retry logic and health check"""
         try:
-            self.client = MongoClient(uri)
-            self.db = self.client[db_name]
+            # Set a reasonable timeout for connection attempts
+            self.client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
+            # Validate connection is working with a ping
+            self.client.admin.command('ping')
+            self.db = self.client[self.db_name]
             self.collection = self.db["xml_to_json"]
-            self.logger.info("MongoDB connected successfully.")
+            self.logger.info("MongoDB connected successfully")
+            return True
+        except mongo_errors.ConnectionFailure as e:
+            self.logger.error(f"MongoDB connection failed: {e}")
+            self.client = None
+            return False
         except Exception as e:
-            self.logger.warning(f"MongoDB connection failed: {e}")
-            self.client = None  # Set to None if MongoDB isn't available
+            self.logger.error(f"MongoDB setup error: {e}")
+            self.client = None
+            return False
+
+    def is_connected(self) -> bool:
+        """Check if MongoDB connection is active"""
+        if not self.client:
+            return False
+        try:
+            # Quick ping to verify connection is still alive
+            self.client.admin.command('ping')
+            return True
+        except Exception:
+            return False
 
     def insert(self, data: dict) -> Optional[str]:
-        if not self.client:
-            self.logger.warning("MongoDB client is unavailable. Skipping database insertion.")
-            return None  # Skip MongoDB insertion if the client is unavailable
+        """Insert document with connection verification and retry"""
+        if not self.is_connected() and not self.connect():
+            self.logger.warning("MongoDB unavailable. Skipping database insertion.")
+            return None
 
         try:
             res = self.collection.insert_one(data)
             self.logger.info(f"Inserted record to MongoDB: {res.inserted_id}")
             return str(res.inserted_id)
+        except mongo_errors.AutoReconnect:
+            # Try reconnecting once on connection issues
+            self.logger.warning("MongoDB connection lost, attempting reconnect")
+            if self.connect():
+                try:
+                    res = self.collection.insert_one(data)
+                    return str(res.inserted_id)
+                except Exception as e:
+                    self.logger.error(f"MongoDB insertion retry failed: {e}")
+            return None
         except Exception as e:
             self.logger.error(f"MongoDB insertion error: {e}")
             return None
 
 class FileManager:
-    def __init__(self, upload_dir: str, archive_dir: str, logger: logging.Logger):
-        self.upload_dir = upload_dir
-        self.archive_dir = archive_dir
+    def __init__(self, json_dir: str, logger: logging.Logger):
+        self.json_dir = json_dir
         self.logger = logger
-        os.makedirs(upload_dir, exist_ok=True)
-        os.makedirs(archive_dir, exist_ok=True)
+        os.makedirs(json_dir, exist_ok=True)
 
-    def _unique_filepath(self, target_dir: str, filename: str, request_id: str) -> str:
-        base = os.path.basename(filename)
-        path = os.path.join(target_dir, base)
-        if os.path.exists(path):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            name, ext = os.path.splitext(base)
-            path = os.path.join(target_dir, f"{name}_{ts}{ext}")
-            self.logger.info(f"Filename exists, renamed to {path}", extra={"request_id": request_id})
-        return path
-
-    def save_xml(self, content: str, request_id: str, target: str, filename: Optional[str] = None) -> str:
-        target_dir = self.upload_dir if target == "active" else self.archive_dir
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = filename or f"xml_{ts}_{uuid.uuid4().hex[:8]}.xml"
-        if not fname.lower().endswith('.xml'):
-            fname += '.xml'
-        path = self._unique_filepath(target_dir, fname, request_id)
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        self.logger.info(f"Saved XML: {path}", extra={"request_id": request_id})
-        return path
-
-    def save_json(self, data: dict, xml_path: str, request_id: str) -> Optional[str]:
-        json_path = xml_path.replace('.xml', '.json')
+    def _get_timestamped_filename(self, prefix: str) -> str:
+        """Generate a unique filename with current timestamp"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = uuid.uuid4().hex[:8]
+        return f"{prefix}_{timestamp}_{unique_id}.json"
+    
+    def save_json(self, data: dict, request_id: str, prefix: str = "doc") -> str:
+        """Save JSON data to file with timestamp in filename"""
+        filename = self._get_timestamped_filename(prefix)
+        filepath = os.path.join(self.json_dir, filename)
+        
         try:
-            with open(json_path, 'w', encoding='utf-8') as f:
+            with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4, cls=JSONEncoder)
-            self.logger.info(f"Saved JSON: {json_path}", extra={"request_id": request_id})
-            return json_path
+            self.logger.info(f"Saved JSON: {filepath}", extra={"request_id": request_id})
+            return filepath
         except Exception as e:
             self.logger.error(f"Error saving JSON: {e}", extra={"request_id": request_id})
-            return None
+            raise IOError(f"Failed to save JSON: {e}")
 
 """Models"""
-
 
 class XMLData(BaseModel):
     xml: str
@@ -139,42 +164,52 @@ class XMLProcessor:
             return ET.fromstring(xml_content)
         except ET.ParseError as e:
             self.logger.error(f"ParseError: {e}", extra={"request_id": request_id})
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=f"Invalid XML: {str(e)}")
 
-    async def process(self, xml_list: List[str], request_id: str, target: str) -> ProcessingResult:
+    async def process(self, xml_list: List[str], request_id: str) -> ProcessingResult:
         results = []
-        saved_xmls = []
         saved_jsons = []
+        
         for idx, xml_str in enumerate(xml_list):
-            root = self.validate(xml_str, request_id)
-            self.logger.info(f"XML validated (root={root.tag})", extra={"request_id": request_id})
-            data = xmltodict.parse(xml_str)
-
-            # Skip MongoDB insertion if MongoDB is unavailable
-            mongo_id = None
-            if self.mongo.client:
-                mongo_id = self.mongo.insert(data)
-
-            fname = f"doc_{idx+1}.xml"
-            xml_path = self.fm.save_xml(xml_str, request_id, target, filename=fname)
-            json_path = self.fm.save_json(data, xml_path, request_id)
-
-            results.append({
-                'index': idx,
-                'root': root.tag,
-                'mongo_id': mongo_id,
-                'xml_path': xml_path,
-                'json_path': json_path
-            })
-            saved_xmls.append(xml_path)
-            saved_jsons.append(json_path)
+            try:
+                # Validate XML structure
+                root = self.validate(xml_str, request_id)
+                self.logger.info(f"XML validated (root={root.tag})", extra={"request_id": request_id})
+                
+                # Convert XML to JSON
+                json_data = xmltodict.parse(xml_str)
+                
+                # Store in MongoDB if available
+                mongo_id = self.mongo.insert(json_data)
+                if not mongo_id:
+                    self.logger.warning("MongoDB storage skipped", extra={"request_id": request_id})
+                
+                # Save JSON to file with timestamp in name
+                prefix = f"doc_{idx+1}"
+                json_path = self.fm.save_json(json_data, request_id, prefix)
+                saved_jsons.append(json_path)
+                
+                results.append({
+                    'index': idx,
+                    'root': root.tag,
+                    'mongo_id': mongo_id,
+                    'json_path': json_path
+                })
+                
+            except Exception as e:
+                self.logger.error(f"Error processing XML document {idx}: {e}", extra={"request_id": request_id})
+                results.append({
+                    'index': idx,
+                    'error': str(e),
+                    'status': 'failed'
+                })
 
         return ProcessingResult(
             success=True,
             message=f"Processed {len(xml_list)} document(s)",
-            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             xml_count=len(xml_list),
-            details={'processed': results, 'saved_xmls': saved_xmls, 'saved_jsons': saved_jsons}
+            details={'processed': results, 'saved_jsons': saved_jsons}
         )
 
 """API Application"""
@@ -182,18 +217,20 @@ class XMLProcessor:
 class XMLAPIApp:
     def __init__(self):
         # config dirs
-        self.upload_dir = 'uploads'
-        self.archive_dir = 'archive'
+        self.json_dir = 'uploads'
         # setup logger
         self.logger = LoggerConfig().logger
         # managers
-        self.mongo = MongoManager("mongodb://localhost:27017/", "xml_to_json", self.logger)
-        self.fm = FileManager(self.upload_dir, self.archive_dir, self.logger)
+        mongo_uri = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/")
+        mongo_db = os.environ.get("MONGODB_DB", "xml_to_json")
+        self.mongo = MongoManager(mongo_uri, mongo_db, self.logger)
+        self.fm = FileManager(self.json_dir, self.logger)
         self.processor = XMLProcessor(self.fm, self.mongo, self.logger)
         # FastAPI
         self.app = FastAPI(
-            title="XML Request Handler API",
-            version="1.0.0"
+            title="XML to JSON Processor API",
+            version="1.1.0",
+            description="Processes XML data and stores as JSON with MongoDB integration"
         )
         self.app.add_middleware(
             CORSMiddleware,
@@ -231,65 +268,80 @@ class XMLAPIApp:
         if isinstance(exc, HTTPException):
             self.logger.warning(f"HTTPException: {exc.detail}", extra={"request_id": rid})
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail, "request_id": rid})
-        self.logger.error(f"Unhandled: {exc}", extra={"request_id": rid})
-        return JSONResponse(status_code=500, content={"detail": "Internal error", "request_id": rid})
+        self.logger.error(f"Unhandled: {exc}\n{traceback.format_exc()}", extra={"request_id": rid})
+        return JSONResponse(
+            status_code=500, 
+            content={
+                "detail": "Internal server error", 
+                "request_id": rid,
+                "error": str(exc)
+            }
+        )
 
     def _register_routes(self):
         @self.router.post("/api/xml", response_model=ProcessingResult)
-        async def xml_endpoint(
+        async def process_xml(
             request: Request,
             files: Optional[List[UploadFile]] = File(None)
         ):
             rid = request.state.request_id
             xmls = []
-            # handle files or raw body
+            
+            # Handle XML from files or raw body
             if files:
                 for f in files:
                     if f.filename.lower().endswith('.xml'):
                         content = await f.read()
-                        xmls.append(content.decode())
+                        xmls.append(content.decode('utf-8', errors='replace'))
             else:
-                body = await request.body()
-                txt = body.decode()
-                xmls = [txt] if txt.strip().startswith('<') else []
+                # Process raw XML body
+                try:
+                    body = await request.body()
+                    txt = body.decode('utf-8', errors='replace')
+                    if txt.strip().startswith('<'):
+                        xmls.append(txt)
+                except Exception as e:
+                    self.logger.error(f"Error reading request body: {e}", extra={"request_id": rid})
+                    raise HTTPException(status_code=400, detail="Invalid request body")
+            
+            # Validate we have XML to process
             if not xmls:
-                raise HTTPException(status_code=400, detail="No XML found")
-            return await self.processor.process(xmls, rid, target='active')
-
-        @self.router.post("/api/xml_secondary", response_model=ProcessingResult)
-        async def archive_endpoint(
-            request: Request,
-            files: Optional[List[UploadFile]] = File(None)
-        ):
-            rid = request.state.request_id
-            xmls = []
-            if files:
-                for f in files:
-                    if f.filename.lower().endswith('.xml'):
-                        content = await f.read()
-                        xmls.append(content.decode())
-            else:
-                body = await request.body()
-                txt = body.decode()
-                xmls = [txt] if txt.strip().startswith('<') else []
-            if not xmls:
-                raise HTTPException(status_code=400, detail="No XML found")
-            return await self.processor.process(xmls, rid, target='archive')
+                raise HTTPException(status_code=400, detail="No valid XML content found")
+                
+            # Process the XML data
+            return await self.processor.process(xmls, rid)
 
         @self.router.get("/health")
         async def health(request: Request):
             rid = request.state.request_id
-            count_up = len([f for f in os.listdir(self.upload_dir) if f.endswith('.xml')])
-            count_arc = len([f for f in os.listdir(self.archive_dir) if f.endswith('.xml')])
-            return {"status": "healthy", "uploads": count_up, "archive": count_arc, "request_id": rid}
+            mongo_status = "connected" if self.mongo.is_connected() else "disconnected"
+            json_count = len([f for f in os.listdir(self.json_dir) if f.endswith('.json')])
+            
+            return {
+                "status": "healthy", 
+                "mongo": mongo_status,
+                "json_files": json_count,
+                "request_id": rid,
+                "timestamp": datetime.now().isoformat()
+            }
 
         @self.router.get("/")
         async def root(request: Request):
             rid = request.state.request_id
-            return {"name": "XML API", "version": "1.0.0", "request_id": rid}
+            return {
+                "name": "XML to JSON Processor API", 
+                "version": "1.1.0", 
+                "request_id": rid,
+                "mongo_status": "connected" if self.mongo.is_connected() else "disconnected"
+            }
 
-    def run(self):
-        uvicorn.run(self.app, host="0.0.0.0", port=8000, reload=True)
+    def run(self, host: str = "0.0.0.0", port: int = 8000):
+        uvicorn.run(self.app, host=host, port=port, reload=True)
 
 """Run the application"""
 app = XMLAPIApp().app
+
+if __name__ == "__main__":
+    # Start server if script is run directly
+    port = int(os.environ.get("PORT", 8000))
+    XMLAPIApp().run(port=port)
